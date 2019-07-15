@@ -80,17 +80,112 @@
 */
 
 #include "utils.h"
+#include "float.h"
 
-void your_histogram_and_prefixsum(const float* const d_logLuminance,
-                                  unsigned int* const d_cdf,
+__global__ void local_min(const float *const d_logLuminance,
+                          float *const d_min,
+                          const size_t numRows,
+                          const size_t numCols)
+{
+   extern __shared__ float s_patch[];
+
+   int c = blockIdx.x * blockDim.x + threadIdx.x;
+   int r = blockIdx.y * blockDim.y + threadIdx.y;
+
+   int global_pos = r * numCols + c;
+   int patch_pos = threadIdx.y * blockDim.x + threadIdx.y;
+
+   s_patch[patch_pos] = (global_pos < numRows * numCols ? d_logLuminance[global_pos]
+                                                        : FLT_MAX);
+   __syncthreads();
+
+   int start = (blockDim.x * blockDim.y >> 1);
+   for (int mid = start; mid > 0; mid = mid >> 1)
+   {
+      if (patch_pos < mid)
+      {
+         s_patch[patch_pos] = s_patch[patch_pos] < s_patch[mid + patch_pos] ? s_patch[patch_pos] : s_patch[mid + patch_pos];
+      }
+      __syncthreads();
+   }
+
+   if (threadIdx.x == 0 && threadIdx.y == 0)
+      d_min[blockIdx.y * blockDim.x + blockIdx.x] = s_patch[0];
+}
+
+__global__ void local_max(const float *const d_logLuminance,
+                          float *const d_max,
+                          const size_t numRows,
+                          const size_t numCols)
+{
+   extern __shared__ float s_patch[];
+
+   int c = blockIdx.x * blockDim.x + threadIdx.x;
+   int r = blockIdx.y * blockDim.y + threadIdx.y;
+
+   int global_pos = r * numCols + c;
+   int patch_pos = threadIdx.y * blockDim.x + threadIdx.y;
+
+   s_patch[patch_pos] = (global_pos < numRows * numCols ? d_logLuminance[global_pos]
+                                                        : -FLT_MAX);
+   __syncthreads();
+
+   // if (blockIdx.x == 0 && blockIdx.y == 0)
+   // {
+   //    printf("Global Pos:%d \t Max:%f\n", blockIdx.y * blockDim.x + blockIdx.x, s_patch[patch_pos]);
+   // }
+
+   int start = (blockDim.x * blockDim.y >> 1);
+   for (int mid = start; mid > 0; mid = mid >> 1)
+   {
+      if (patch_pos < mid)
+      {
+         s_patch[patch_pos] = s_patch[patch_pos] > s_patch[mid + patch_pos] ? s_patch[patch_pos] : s_patch[mid + patch_pos];
+      }
+      __syncthreads();
+   }
+
+   if (threadIdx.x == 0 && threadIdx.y == 0)
+   {
+      d_max[blockIdx.y * blockDim.x + blockIdx.x] = s_patch[0];
+      // printf("Global Pos:%d \t Max:%f\n", blockIdx.y * blockDim.x + blockIdx.x, s_patch[0]);
+   }
+}
+
+void global_extrema(const float *const d_min, const float *const d_max, float &min, float &max, int len)
+{
+   using namespace std;
+   {
+      min = FLT_MAX;
+      max = -FLT_MAX;
+
+      cout << "Length: " << len << "\nOriginal: \n";
+      cout << "Min: \n";
+      for (int i = 0; i < len; ++i)
+         cout << d_min[i] << " ";
+
+      cout << "\nMax: \n";
+      for (int i = 0; i < len; ++i)
+         cout << d_max[i] << " ";
+
+      for (int i = 0; i < len; ++i)
+      {
+         min = d_min[i] < min ? d_min[i] : min;
+         max = d_max[i] > max ? d_max[i] : max;
+      }
+   }
+}
+
+void your_histogram_and_prefixsum(const float *const d_logLuminance,
+                                  unsigned int *const d_cdf,
                                   float &min_logLum,
                                   float &max_logLum,
                                   const size_t numRows,
                                   const size_t numCols,
                                   const size_t numBins)
 {
-  //TODO
-  /*Here are the steps you need to implement
+   //TODO
+   /*Here are the steps you need to implement
     1) find the minimum and maximum value in the input logLuminance channel
        store in min_logLum and max_logLum
     2) subtract them to find the range
@@ -100,5 +195,35 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
 
+   float *arr;
 
+   checkCudaErrors(cudaMallocManaged((void **)&arr, sizeof(float) * numCols * numRows));
+
+   for (int i = 0; i < numRows * numCols; ++i)
+      arr[i] = 5.0f;
+
+   arr[0] = 10.0f;
+   arr[1] = 3.0f;
+
+   dim3 blockSize(32, 32, 1);
+   dim3 gridSize((numCols + blockSize.x - 1) / blockSize.x, (numRows + blockSize.y - 1) / blockSize.y, 1);
+
+   float *d_min, *d_max;
+   checkCudaErrors(cudaMallocManaged((void **)&d_min, sizeof(float) * gridSize.x * gridSize.y));
+   checkCudaErrors(cudaMallocManaged((void **)&d_max, sizeof(float) * gridSize.x * gridSize.y));
+
+   local_min<<<gridSize, blockSize, sizeof(float) * blockSize.x * blockSize.y>>>(arr, d_min, numRows, numCols);
+   cudaDeviceSynchronize();
+   checkCudaErrors(cudaGetLastError());
+
+   local_max<<<gridSize, blockSize, sizeof(float) * blockSize.x * blockSize.y>>>(arr, d_max, numRows, numCols);
+   cudaDeviceSynchronize();
+   checkCudaErrors(cudaGetLastError());
+
+   global_extrema(d_min, d_max, min_logLum, max_logLum, gridSize.x * gridSize.y);
+   checkCudaErrors(cudaFree(d_min));
+   checkCudaErrors(cudaFree(d_max));
+
+   std::cout << "\nMin: " << min_logLum << "\n"
+             << "Max: " << max_logLum << "\n";
 }
